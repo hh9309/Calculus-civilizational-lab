@@ -471,56 +471,77 @@ app.post("/api/python/execute", (req, res) => {
 
   fs.writeFile(tempFilePath, code, "utf8", (writeErr) => {
     if (writeErr) {
-      return res.status(500).json({
+      return res.json({
         success: false,
-        error: "无法写入临时脚本文件",
-        details: writeErr.message,
+        stdout: "",
+        stderr: `无法写入临时脚本文件: ${writeErr.message}`,
+        exitCode: 1,
+        executionTimeMs: 0,
+        standaloneCheck: externalDependenciesCheck,
       });
     }
 
     const startTime = Date.now();
     const cmdArgs = [tempFilePath, ...(Array.isArray(args) ? args.map(String) : [])];
 
-    const pythonProcess = spawn("python3", cmdArgs, {
-      timeout: 8000, // 8s timeout limit
-    });
+    // Try python3 first, fallback to python if needed
+    let pythonExecutable = "python3";
+    
+    const runProcess = (executable: string) => {
+      let isSettled = false;
+      let stdout = "";
+      let stderr = "";
 
-    let stdout = "";
-    let stderr = "";
-
-    pythonProcess.stdout.on("data", (data) => {
-      stdout += data.toString();
-    });
-
-    pythonProcess.stderr.on("data", (data) => {
-      stderr += data.toString();
-    });
-
-    pythonProcess.on("error", (procErr) => {
-      fs.unlink(tempFilePath, () => {});
-      return res.json({
-        success: false,
-        stdout,
-        stderr: stderr || procErr.message,
-        exitCode: 1,
-        executionTimeMs: Date.now() - startTime,
-        standaloneCheck: externalDependenciesCheck,
+      const pythonProcess = spawn(executable, cmdArgs, {
+        timeout: 8000, // 8s timeout limit
       });
-    });
 
-    pythonProcess.on("close", (exitCode) => {
-      fs.unlink(tempFilePath, () => {});
-      const executionTimeMs = Date.now() - startTime;
-
-      res.json({
-        success: exitCode === 0,
-        stdout,
-        stderr,
-        exitCode: exitCode ?? 0,
-        executionTimeMs,
-        standaloneCheck: externalDependenciesCheck,
+      pythonProcess.stdout.on("data", (data) => {
+        stdout += data.toString();
       });
-    });
+
+      pythonProcess.stderr.on("data", (data) => {
+        stderr += data.toString();
+      });
+
+      pythonProcess.on("error", (procErr: any) => {
+        if (isSettled) return;
+        // If python3 not found, try fallback to python
+        if (executable === "python3" && (procErr.code === "ENOENT" || procErr.message?.includes("ENOENT"))) {
+          runProcess("python");
+          return;
+        }
+
+        isSettled = true;
+        fs.unlink(tempFilePath, () => {});
+        return res.json({
+          success: false,
+          stdout,
+          stderr: stderr || `Python 执行错误: ${procErr.message || procErr}`,
+          exitCode: 1,
+          executionTimeMs: Date.now() - startTime,
+          standaloneCheck: externalDependenciesCheck,
+        });
+      });
+
+      pythonProcess.on("close", (exitCode) => {
+        if (isSettled) return;
+        isSettled = true;
+        fs.unlink(tempFilePath, () => {});
+        const executionTimeMs = Date.now() - startTime;
+
+        res.json({
+          success: exitCode === 0,
+          stdout,
+          stderr,
+          exitCode: exitCode ?? 0,
+          executionTimeMs,
+          standaloneCheck: externalDependenciesCheck,
+        });
+      });
+    };
+
+    runProcess(pythonExecutable);
   });
 });
 

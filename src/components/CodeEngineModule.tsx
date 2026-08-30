@@ -5,6 +5,11 @@ import {
   PythonAlgorithm,
 } from "../data/pythonAlgorithms";
 import {
+  executePythonCodeUnified,
+  ExecutionEnginePreference,
+  PythonExecutionResult,
+} from "../utils/pythonRunner";
+import {
   Code2,
   Play,
   Copy,
@@ -22,6 +27,8 @@ import {
   RotateCcw,
   CheckCircle2,
   Share2,
+  Server,
+  Zap,
 } from "lucide-react";
 
 export const CodeEngineModule: React.FC = () => {
@@ -36,6 +43,10 @@ export const CodeEngineModule: React.FC = () => {
   const [editableCode, setEditableCode] = useState<string>(
     currentAlgo.defaultCode
   );
+
+  // Engine Preference & Active Engine Status
+  const [enginePreference, setEnginePreference] = useState<ExecutionEnginePreference>("auto");
+  const [activeEngineUsed, setActiveEngineUsed] = useState<"server_python3" | "client_sandbox">("server_python3");
 
   // Parameters State
   const [paramN, setParamN] = useState<number>(
@@ -81,7 +92,7 @@ export const CodeEngineModule: React.FC = () => {
     }
   }, [selectedAlgoId]);
 
-  // Execute Python Code via Node Server subprocess
+  // Execute Python Code via Unified Dual Engine (Server-side Python 3 + Client sandbox fallback)
   const handleExecuteCode = async (customCode?: string) => {
     setIsRunning(true);
     const codeToRun = customCode ?? editableCode;
@@ -103,28 +114,24 @@ export const CodeEngineModule: React.FC = () => {
         cliArgs = [String(paramX)];
       }
 
-      const res = await fetch("/api/python/execute", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          code: codeToRun,
-          args: cliArgs,
-        }),
-      });
+      const res: PythonExecutionResult = await executePythonCodeUnified(
+        codeToRun,
+        selectedAlgoId,
+        cliArgs,
+        enginePreference
+      );
 
-      if (!res.ok) {
-        throw new Error(`HTTP Error: ${res.statusText}`);
+      setOutputStdout(res.stdout || "");
+      setOutputStderr(res.stderr || "");
+      setExitCode(res.exitCode);
+      setExecutionTime(res.executionTimeMs);
+      setActiveEngineUsed(res.engineUsed);
+      if (res.standaloneCheck) {
+        setStandaloneCheck(res.standaloneCheck);
       }
-
-      const data = await res.json();
-      setOutputStdout(data.stdout || "");
-      setOutputStderr(data.stderr || "");
-      setExitCode(data.exitCode);
-      setExecutionTime(data.executionTimeMs);
-      setStandaloneCheck(data.standaloneCheck);
     } catch (err: any) {
       console.error("Execution error:", err);
-      setOutputStderr(`执行异常: ${err.message}`);
+      setOutputStderr(`执行异常: ${err.message || err}`);
       setExitCode(1);
     } finally {
       setIsRunning(false);
@@ -134,7 +141,7 @@ export const CodeEngineModule: React.FC = () => {
   // Run automatically on first mount or algorithm selection
   useEffect(() => {
     handleExecuteCode(currentAlgo.defaultCode);
-  }, [selectedAlgoId]);
+  }, [selectedAlgoId, enginePreference]);
 
   const handleCopyCode = () => {
     navigator.clipboard.writeText(editableCode);
@@ -231,8 +238,49 @@ export const CodeEngineModule: React.FC = () => {
           </p>
         </div>
 
-        {/* Action Buttons */}
-        <div className="flex items-center space-x-2 shrink-0">
+        {/* Action Buttons & Engine Selector */}
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          {/* Engine Selector */}
+          <div className="flex items-center space-x-1 bg-white border border-[#D4C5B0] rounded-lg p-1 text-[11px] font-mono">
+            <span className="text-[#8E887B] px-1.5 flex items-center space-x-1">
+              <Cpu className="w-3 h-3 text-[#5A5A40]" />
+              <span className="hidden sm:inline">引擎:</span>
+            </span>
+            <button
+              onClick={() => setEnginePreference("auto")}
+              className={`px-2 py-0.5 rounded cursor-pointer transition-colors ${
+                enginePreference === "auto"
+                  ? "bg-[#5A5A40] text-white font-bold"
+                  : "text-[#7A7468] hover:bg-[#F0EEE6]"
+              }`}
+              title="智能自动模式：优先原生 Python 3，异常时秒级自动无缝切入内置算法沙盒"
+            >
+              自动
+            </button>
+            <button
+              onClick={() => setEnginePreference("server")}
+              className={`px-2 py-0.5 rounded cursor-pointer transition-colors ${
+                enginePreference === "server"
+                  ? "bg-[#5A5A40] text-white font-bold"
+                  : "text-[#7A7468] hover:bg-[#F0EEE6]"
+              }`}
+              title="原生 Python 3 后端进程执行"
+            >
+              Python 3
+            </button>
+            <button
+              onClick={() => setEnginePreference("client")}
+              className={`px-2 py-0.5 rounded cursor-pointer transition-colors ${
+                enginePreference === "client"
+                  ? "bg-[#5A5A40] text-white font-bold"
+                  : "text-[#7A7468] hover:bg-[#F0EEE6]"
+              }`}
+              title="浏览器内置高精度演算沙盒 (离线零延迟)"
+            >
+              内置沙盒
+            </button>
+          </div>
+
           <button
             onClick={() => handleExecuteCode()}
             disabled={isRunning}
@@ -494,8 +542,33 @@ export const CodeEngineModule: React.FC = () => {
                 </button>
               </div>
 
-              {/* Status and copy */}
+              {/* Status, engine badge and copy */}
               <div className="flex items-center space-x-2">
+                <span
+                  className={`text-[10px] font-mono px-1.5 py-0.5 rounded border flex items-center space-x-1 ${
+                    activeEngineUsed === "server_python3"
+                      ? "bg-emerald-950/40 text-emerald-300 border-emerald-800/60"
+                      : "bg-amber-950/40 text-amber-300 border-amber-800/60"
+                  }`}
+                  title={
+                    activeEngineUsed === "server_python3"
+                      ? "由服务器原生 Python 3.10+ 子进程执行"
+                      : "由浏览器内置高精度演算沙盒执行"
+                  }
+                >
+                  {activeEngineUsed === "server_python3" ? (
+                    <>
+                      <Server className="w-2.5 h-2.5 text-emerald-400" />
+                      <span>Python3 原生</span>
+                    </>
+                  ) : (
+                    <>
+                      <Zap className="w-2.5 h-2.5 text-amber-400" />
+                      <span>内置沙盒</span>
+                    </>
+                  )}
+                </span>
+
                 {executionTime !== null && (
                   <span className="text-[10px] font-mono text-[#8E887B] flex items-center space-x-1">
                     <Clock className="w-3 h-3 text-[#C4A468]" />
