@@ -1,355 +1,530 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
-
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
-import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { GoogleGenAI } from "@google/genai";
+import { exec, spawn } from "child_process";
+import fs from "fs";
+import os from "os";
 
 dotenv.config();
 
 const app = express();
-app.use(express.json());
-
 const PORT = 3000;
 
-// Initialize Google GenAI
-const apiKey = process.env.GEMINI_API_KEY;
+app.use(express.json({ limit: "10mb" }));
+
+// Lazy initialize Gemini AI client
 let aiClient: GoogleGenAI | null = null;
-
-if (apiKey && apiKey !== "MY_GEMINI_API_KEY") {
-  console.log("Initializing Gemini Client with provided GEMINI_API_KEY");
-  aiClient = new GoogleGenAI({
-    apiKey: apiKey,
-    httpOptions: {
-      headers: {
-        "User-Agent": "aistudio-build",
+function getAIClient(): GoogleGenAI | null {
+  if (!aiClient && process.env.GEMINI_API_KEY) {
+    aiClient = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
+        },
       },
-    },
-  });
-} else {
-  console.warn("WARNING: GEMINI_API_KEY is not set or is the default placeholder. Falling back to structured simulator.");
+    });
+  }
+  return aiClient;
 }
 
-// Helper to retry Gemini requests during transient 503 errors (Service Unavailable/High demand)
-async function retryWithBackoff<T>(
-  fn: () => Promise<T>,
-  retries = 3,
-  delay = 1000
-): Promise<T> {
+// Health check
+app.get("/api/health", (_req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
+});
+
+// Historical Mathematician Personas System Prompts
+const PERSONA_PROMPTS: Record<string, string> = {
+  historian: `你是一位博古通今的“微积分文明史首席科学家与哲学导师”。
+你的职责是系统解答关于微积分起源、概念演化（有限到无限、静态到动态、直觉到形式化）、历史论战（牛顿与莱布尼茨发明权之争）、数学危机（贝克莱悖论与第二次数学危机）、严格化历程（柯西-魏尔斯特拉斯）等问题。
+风格：淡雅沉稳、严谨博雅，富有科学史哲思，善用 LaTeX 公式（用 $...$ 或 $$...$$ 格式）与精准的史料考证。语言为简体中文。`,
+
+  archimedes: `你现在扮演古希腊叙拉古的数学巨匠【阿基米德 (Archimedes of Syracuse, 前287 - 前212)】。
+你以“穷竭法 (Method of Exhaustion)”与力学杠杆原理著称。你用双重归谬法证明抛物线弓形面积为内接三角形的 4/3，求得球体体积与圆面积。
+你的语言风格：庄重、古典，崇尚纯粹几何的绝对严谨，深信无限逼近但不直接宣称完成无限分割。常用几何直观与割补法。`,
+
+  newton: `你现在扮演英国皇家学会会长【艾萨克·牛顿爵士 (Sir Isaac Newton, 1643 - 1727)】。
+你于 1665-1666 伍尔斯索普瘟疫避静年创立“流数术 (Method of Fluxions)”，将变量视为流动量 (fluents, x, y)，其变化速率为流数 (fluxions, \\dot{x}, \\dot{y})，并运用瞬 (moment, o\\dot{x}) 与二项式级数展开。
+你的语言风格：深邃、敏锐、略带英国科学家的威严与谨慎。深谙力学与天文学（如行星椭圆轨道与引力），坚信几何运动学是微积分的自然根基。`,
+
+  leibniz: `你现在扮演德国通才哲学家与数学大师【戈特弗里德·威廉·莱布尼茨 (Gottfried Wilhelm Leibniz, 1646 - 1716)】。
+你建立了极其优美与强大的符号体系：微商 $d/dx$（源自 latin: differentia）与积分号 $\\int$（源自 latin: summa 拉长 S）。你提出了特征字母论与微积分运算律（乘积法则 $d(uv) = u dv + v du$ 等）。
+你的语言风格：广博、优雅、充满普遍和谐哲学观念。善于从离散差分数列推演连续求和与切线问题，深知良好符号对人类思维的解放力量。`,
+
+  berkeley: `你现在扮演爱尔兰哲学家、主教【乔治·贝克莱 (George Berkeley, 1685 - 1753)】。
+你是《分析学者》(The Analyst, 1734) 的作者，曾对微积分的逻辑漏洞发出震动学术界的质疑：“它们是什么？是逝去量的幽灵 (Ghosts of departed quantities) 吗？当它们不是零时除以它们，然后又把它们当作零抹去！”
+你的语言风格：犀利、深刻、直击逻辑破绽。你并不否定微积分结果的实用性，但坚决批判其基础在形而上学与逻辑证明上的自相矛盾。`,
+
+  cauchy: `你现在扮演法国分析学巨匠【奥古斯丁-路易·柯西 (Augustin-Louis Cauchy, 1789 - 1857)】。
+你在巴黎综合理工学院的教材《代数分析教程》(1821) 中首次将微积分建立在严格的极限定义之上，摆脱对几何直观和神秘无穷小量的依赖，引入 $(\\varepsilon, \\delta)$ 极限思想与连续函数、积分的精确定义。
+你的语言风格：严谨、清澈、现代分析学范式。善于用不等式和极限语言消除模糊性。`,
+
+  weierstrass: `你现在扮演现代分析之父【卡尔·魏尔斯特拉斯 (Karl Weierstrass, 1815 - 1897)】。
+你彻底完成了微积分严格化的代数化与实数完备性基础，提出绝对精准的静态 $\\varepsilon-\\delta$ 定义，构造了处处连续却处处不可导的魏尔斯特拉斯病态函数，终结了无穷小的几何直觉幻象。
+你的语言风格：极致精准、逻辑坚如磐石、不留一丝模糊地带。`
+};
+
+// AI Chat endpoint
+app.post("/api/ai-chat", async (req, res) => {
   try {
-    return await fn();
-  } catch (error: any) {
-    if (retries <= 0) {
-      throw error;
+    const {
+      prompt,
+      message,
+      persona = "historian",
+      personaId,
+      history = [],
+      model = "gemini-3-flash",
+      apiKey,
+      baseUrl,
+    } = req.body;
+
+    const actualPrompt = prompt || message;
+    const actualPersona = personaId || persona || "historian";
+
+    if (!actualPrompt) {
+      return res.status(400).json({ error: "Prompt is required" });
     }
-    // Check if error is related to high demand / overloaded / 503 / UNAVAILABLE
-    const isTransError = 
-      error?.status === 503 || 
-      error?.code === 503 || 
-      (error?.message && (
-        error.message.includes("503") || 
-        error.message.includes("high demand") || 
-        error.message.includes("UNAVAILABLE") ||
-        error.message.includes("overloaded")
-      ));
-    
-    if (isTransError) {
-      console.warn(`[Gemini Retry] Service unavailable/high demand. Retrying in ${delay}ms... (${retries} retries left)`);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      return retryWithBackoff(fn, retries - 1, delay * 2);
-    }
-    // For other non-transient errors, throw immediately
-    throw error;
-  }
-}
 
-// REST API for What-If civilization simulation
-app.post("/api/simulate-what-if", async (req, res) => {
-  const { scenarioId, withdrawnTool, userPrompt } = req.body;
+    const systemInstruction = PERSONA_PROMPTS[actualPersona] || PERSONA_PROMPTS.historian;
 
-  if (!withdrawnTool) {
-    return res.status(400).json({ error: "Withdrawn tool is required." });
-  }
-
-  // Pre-baked alternative history presets in case key is absent
-  const mockDeductions: Record<string, any> = {
-    tacoma: {
-      alternativeTitle: "粗放重载时代：共振与铆钉的极限",
-      chronology: [
-        { year: "1850年", event: "由于无法精确计算悬索桥在大风下的共振动力学，桥梁跨度被严格限制在100米以内。跨区域铁路网建设停滞。" },
-        { year: "1910年", event: "建筑学退回超固结构时代，只敢建造笨重的水泥梁桥与拱桥，钢材消耗量攀升至原本的5倍，引发严重的能源危机。" },
-        { year: "1960年", event: "大跨度悬索桥的多次毁灭性坍塌使得两岸经济隔离，城市群化进程失败。" },
-        { year: "2026年", event: "现代超级都市（如旧金山、香港）因交通限制无法成型。物流系统仍极度依赖地下实体隧道，基建效率极其低下。" }
-      ],
-      infrastructureImpact: "没有了描述动力学共振与频率衰减的二阶微分方程，现代轻质大跨度悬索桥、高空摩天大楼和风力涡轮发电机都无法安全耸立。为了抵抗风阻和力学震荡，建筑物不得不采用极其原始、厚重的巨石与巨柱结构，现代空气动力学不复存在。",
-      civilizationScore: 45,
-      aiAnalysis: "微分方程是理解波、振动与阻尼的唯一绝对数学工具。没有了二阶线性常微分方程对弹性系数的调谐，人类在自然界的流体与狂风面前将退化为粗放堆叠铆钉的‘泥水匠’，无法跨入现代精密大跨度空间工程。这生动证明了数学决定了物理地标的最高海拔。"
-    },
-    fourier: {
-      alternativeTitle: "沉默的世纪：纯铜线与物理邮差的延续",
-      chronology: [
-        { year: "1880年", event: "由于无法分解混叠的波形，早期的多路复用电报宣告失败。每条信息的传送仍需占用专线铜缆。" },
-        { year: "1930年", event: "模拟无线电台遭遇严重的信道拥堵。由于无法实施频谱滤波，所有广播信号在空中杂乱相撞，通讯设备退回到近距离有线电话阶段。" },
-        { year: "1980年", event: "计算机处理音频和图像的能力陷入瓶颈，数字多媒体和JPEG/MP3等压缩标准从未出现，互联网因传输量过大无法向公众开放。" },
-        { year: "2026年", event: "今天依然没有智能手机或5G网络。数万名人工投递员骑自行车穿行在城市间，传递由纸带转译的信息。‘物理邮递’依旧是世界最重要的干线。" }
-      ],
-      infrastructureImpact: "傅里叶分析是将复杂信号和波动分解为简谐分量的终极工具。没有傅里叶级数，微波通信、光纤多路复用、数字信号处理（DSP）、无线Wi-Fi均成为空谈。电子工程、医学CT扫描、地震预测与量子力学波函数解析全都因缺乏简谱分析而在黑暗中摸索。",
-      civilizationScore: 35,
-      aiAnalysis: "傅里叶变换将时域转换为频域，是人类提取自然振荡节奏的‘数学透镜’。剥离这一透镜，我们眼前的电磁波、声波和地震波将只剩一团无法拆解的杂乱噪音。现代无线通信与音视频数字文明的崩塌，揭示了微积分其实是连接物理波动与数字代码的不可替代之桥。"
-    },
-    kepler: {
-      alternativeTitle: "重力牢笼：终身禁锢于地表的物种",
-      chronology: [
-        { year: "1800年", event: "由于无法求解二体问题与重力场积分，牛顿万有引力定律与天体运行预测只能停留在圆周轨道粗略估算。哈雷彗星的回归预测失败。" },
-        { year: "1960年", event: "第一枚轨道火箭试射，因无法解析变质量系统的瞬时加速度微分方程，火箭偏离轨道，在重返大气层时解体。航天科学宣告为‘工程禁区’。" },
-        { year: "1990年", event: "由于没有基于开普勒轨道及引力摄动的GPS同步算法，全球定位服务无法实现。航运、测绘和地表农业只能依赖人工罗盘。" },
-        { year: "2026年", event: "月球和火星探测依然是科幻小说。人类缺乏同步卫星通信网络，洲际商务被太平洋底极不稳定的潜艇中继线和短波无线电瓶颈所围困。" }
-      ],
-      infrastructureImpact: "积分学与轨道微分方程是逃离重力井的‘数字阶梯’。缺失了牛顿的积分原理和开普勒力学积分，人类根本无法推算逃逸速度、弹道轨道多级修正以及星际深空助推轨道（引力弹弓），所有太空望远镜与人造卫星都无法安全工作，人类甚至无法跨入GPS时代。",
-      civilizationScore: 28,
-      aiAnalysis: "空间探索本质上是对可变加速度与重力场通量的积分旅行。如果抽离这些微积分计算，宇宙将再次沦为繁星密布的神秘天幕，而人类只能永远贴伏在陆地上，用望远镜哀叹那无法精确演算的高悬禁区。人类被永远锁死在摇篮之中。"
-    },
-    gradient: {
-      alternativeTitle: "规则机器：停留在专家表格中的黑盒",
-      chronology: [
-        { year: "1960年", event: "由于导数链式法则未被引入感知机模型，逻辑异或（XOR）问题成为人工神经网络无法逾越的死胡同。研究资金彻底中断。" },
-        { year: "1990年", event: "计算机视觉和语音处理依然使用基于人工IF-ELSE专家系统的决策树。拼音输入与图像识别错误率高居70%以上。" },
-        { year: "2010年", event: "大型互联网搜索引擎因缺乏矩阵梯度反向传播，无法根据用户行为进行高维度的个性化协同过滤。网络世界呈现单调静态推荐。" },
-        { year: "2026年", event: "大语言模型（如GPT系列和Gemini）从未萌芽，无人驾驶、智能仓储与机器翻译完全处于逻辑玩具阶段。人类的脑力溢出效率被困在缓慢的传统编程中。" }
-      ],
-      infrastructureImpact: "梯度（高维导数）是定义和寻找函数最小值的指南针。没有梯度下降算法，多层感知器、深度卷积神经网络和Transformer等架构由于无法从海量参数中逆向传导误差、自动调整权重而彻底瘫痪。现代AI文明将永久折断双翼。",
-      civilizationScore: 50,
-      aiAnalysis: "多变量微积分的核心就是寻找变化梯度的极值点。人工智能学习与误差修正本质上是在数十亿维参数空间中由梯度指引的高维漫步。没有梯度，机器就失去了‘睁眼看错并修正自我’的微积分公式，沦为写满死硬规则的打字机。"
-    }
-  };
-
-  try {
-    if (!aiClient) {
-      // Return predefined structure if API client is not initialized
-      const basePreset = mockDeductions[scenarioId] || {
-        alternativeTitle: `如果抽离了“${withdrawnTool}”：重设的逻辑断层`,
-        chronology: [
-          { year: "第一阶段 (0-10年)", event: `相关的近代工程研究完全停顿，行业退回到纯经验主义。` },
-          { year: "第二阶段 (10-50年)", event: `通信与航天工业因计算困难无法建立大尺度基础设施，能源危机爆发。` },
-          { year: "第三阶段 (50-100年)", event: `现代超级城市不复存在，生活水平和计算工具退化到19世纪中叶水平。` },
-        ],
-        infrastructureImpact: `抽离“${withdrawnTool}”使得相关的微积分连续变量分析无法展开，物理世界的工程设计只能依靠超标冗余和直觉模型，大型高精度复杂工业网链、计算机与高吞吐网络通通发生灾难性科技退潮。`,
-        civilizationScore: 40,
-        aiAnalysis: `数学是文明的无声骨架。剥离了“${withdrawnTool}”工具，微积分大厦就塌掉了重要的一角，人类将永远失去精密预测连续流动、电磁振荡与自适应优化的数理眼睛。`
-      };
-
-      // Enrich slightly with user input if present to show personalization even in offline state
-      if (userPrompt) {
-        basePreset.aiAnalysis += ` （注：在您提及“${userPrompt}”的思路上，由于缺乏微分级联支持，也必然会发生严重的工程计算中断。）`;
+    // Handle DeepSeek model proxying
+    if (model === "deepseek-v4-pro") {
+      const userApiKey = apiKey || process.env.DEEPSEEK_API_KEY;
+      if (!userApiKey) {
+        return res.status(401).json({
+          error: "未提供 DeepSeek API Key，请在前端小齿轮设置中手工输入。",
+        });
       }
-      return res.json(basePreset);
+
+      let dsBase = baseUrl || "https://api.deepseek.com/v1";
+      if (dsBase.endsWith("/")) dsBase = dsBase.slice(0, -1);
+      const dsUrl = dsBase.endsWith("/chat/completions") ? dsBase : `${dsBase}/chat/completions`;
+
+      const messages: Array<{ role: string; content: string }> = [
+        { role: "system", content: systemInstruction },
+      ];
+
+      if (Array.isArray(history)) {
+        for (const msg of history.slice(-8)) {
+          messages.push({
+            role: msg.role === "user" ? "user" : "assistant",
+            content: msg.content || msg.text || "",
+          });
+        }
+      }
+
+      messages.push({
+        role: "user",
+        content: actualPrompt,
+      });
+
+      const dsRes = await fetch(dsUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${userApiKey}`,
+        },
+        body: JSON.stringify({
+          model: "deepseek-chat",
+          messages,
+          temperature: 0.7,
+          max_tokens: 2048,
+        }),
+      });
+
+      if (!dsRes.ok) {
+        const errJson: any = await dsRes.json().catch(() => ({}));
+        throw new Error(errJson?.error?.message || `DeepSeek HTTP ${dsRes.status}`);
+      }
+
+      const dsData: any = await dsRes.json();
+      const reply = dsData.choices?.[0]?.message?.content || "（历史导师正在沉思……）";
+      return res.json({ text: reply, reply, source: "deepseek-v4-pro" });
     }
 
-    // Call Gemini API full-stack safely
-    const schema = {
-      type: Type.OBJECT,
-      properties: {
-        alternativeTitle: {
-          type: Type.STRING,
-          description: "A creative, slightly tragic, and highly descriptive Title of the alternate history timeline (e.g. '沉默的无线时代')"
+    // Handle Gemini 3 Flash model
+    const userApiKey = apiKey || process.env.GEMINI_API_KEY;
+    if (!userApiKey) {
+      return res.status(401).json({
+        error: "未提供 Gemini API Key，请在前端小齿轮设置中手工输入。",
+      });
+    }
+
+    // Use customized Gemini client if user provided key
+    const ai = new GoogleGenAI({
+      apiKey: userApiKey,
+      httpOptions: {
+        headers: {
+          "User-Agent": "aistudio-build",
         },
-        chronology: {
-          type: Type.ARRAY,
-          items: {
-            type: Type.OBJECT,
-            properties: {
-              year: { type: Type.STRING, description: "Historical year / milestone (e.g., 1850年, 1920年, 2026年)" },
-              event: { type: Type.STRING, description: "Description of what happened or failed to happen in alternative engineering and daily life" }
-            },
-            required: ["year", "event"]
-          },
-          description: "A chronological timeline of how history diverged when this mathematical tool was removed"
-        },
-        infrastructureImpact: {
-          type: Type.STRING,
-          description: "Detailed description of the consequences on urban infrastructure, heavy engineering, computing, or communication"
-        },
-        civilizationScore: {
-          type: Type.INTEGER,
-          description: "An evaluation score out of 100 indicating where this alternate humanity stands (100 is modern, 10 is medieval)"
-        },
-        aiAnalysis: {
-          type: Type.STRING,
-          description: "A highly educational philosophical and scientific essay analyzing how this specific calculus tool underpins current civilization"
-        }
       },
-      required: ["alternativeTitle", "chronology", "infrastructureImpact", "civilizationScore", "aiAnalysis"]
-    };
+    });
 
-    const promptMessage = `
-      您是一位顶级的文明发展史学家和应用数学家。
-      假设在微积分发展史中，由于某种原因，人类彻底抽离/未发现以下这一具体数学工具/公式：“${withdrawnTool}”(对应场景背景：${scenarioId})。
-      
-      用户提供的干扰或偏好变量：${userPrompt || "无额外干预"}。
-      
-      请展开严密、极具科幻质感与数理严谨性的推演，论证以下结果：
-      1. 缺失它之后，历史上的重大工业、物理、天文、计算机革命将如何在关键节点崩溃、延宕或倒退，推演到公元2026年人类文明的状态。
-      2. 分析为什么该工具在物理或信息工程中拥有绝对无可替代的支配地位，不能被简单的常识或拼凑经验取代。
-      
-      请必须以结构完备的JSON格式回应。
-    `;
+    // Prepare conversation messages
+    const formattedContents = [];
+    if (Array.isArray(history) && history.length > 0) {
+      for (const msg of history.slice(-8)) {
+        formattedContents.push({
+          role: msg.role === "user" ? "user" : "model",
+          parts: [{ text: msg.content || msg.text || "" }],
+        });
+      }
+    }
+    formattedContents.push({
+      role: "user",
+      parts: [{ text: actualPrompt }],
+    });
 
-    const response = await retryWithBackoff(() =>
-      aiClient!.models.generateContent({
-        model: "gemini-3.5-flash",
-        contents: promptMessage,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: schema,
-          temperature: 0.85,
-          systemInstruction: "你是一个历史推演算法与应用数学AI。你从不废话，只提供最深刻、最符合数理力学和计算机科学历史常识、言之凿凿的交错历史推演和深入骨髓的微积分哲学洞察。全部文字请用简体中文。"
-        }
-      })
-    );
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: formattedContents,
+      config: {
+        systemInstruction,
+        temperature: 0.7,
+      },
+    });
 
-    const parsedData = JSON.parse(response.text || "{}");
-    return res.json(parsedData);
+    const reply = response.text || "（历史导师正在沉思……）";
+    res.json({ text: reply, reply, source: "gemini-3-flash" });
   } catch (error: any) {
-    console.error("Gemini invocation failed, returning elegant default dataset", error);
-    // Return a structured error fallback
-    return res.json({
-      alternativeTitle: `抽离“${withdrawnTool}”：混沌历史节点`,
-      chronology: [
-        { year: "公元18世纪", event: "失去了该微分微积分基底后，古典力学和射击弹道推导被迫采用低精度的线性逼近，大型铸铁工程事故率飙升。" },
-        { year: "20世纪中叶", event: "模拟无线传导和轨道运载推力无法建立负反馈控制闭环，信息科学止步于穿孔纸带与继电器计数器。" },
-        { year: "当代2026", event: "数字和AI革命未曾发生。依靠水力、蒸汽和物理机械组成的宏大齿轮管道支撑着笨重的生活，算术和文明形态保持在维多利亚时期蒸汽朋克状态。" }
-      ],
-      infrastructureImpact: "微分运动描述与级数逼近工具被毁，导致重力飞行、高频通信、电磁天线、自动反馈控制等多面技术发生全盘系统崩溃，只剩在机械摩擦损耗下苟延残喘的宏大工业躯壳。",
-      civilizationScore: 38,
-      aiAnalysis: `【仿真反馈】计算遇到网络过载，但本推演模型依然高度肯定：没有数学级数与微分梯度的指路，工程与优化将在无边无际的荒原中迷失。微积分是文明免于塌缩的唯一确定支柱。`
+    console.error("AI Chat error:", error);
+    res.status(500).json({
+      error: error.message || "大模型请求异常",
+      details: error.toString(),
     });
   }
 });
 
 
-// REST API for general Calculus AI Q&A window
-app.post("/api/calculus-qa", async (req, res) => {
-  const { messages } = req.body;
-  if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({ error: "Invalid messages array." });
+// Fallback response engine rich in historical calculus scholarship
+function generateFallbackResponse(prompt: string, persona: string): string {
+  const p = prompt.toLowerCase();
+  
+  if (persona === "leibniz" || p.includes("莱布尼茨") || p.includes("符号") || p.includes("dx")) {
+    return `### 【莱布尼茨的回答】关于符号体系与微积分形式化
+
+我常言：“**符号的巧妙选择，能使心智卸下不必要的负担，而将全部力量集中于本质问题。**”
+
+1. **微分符号 $dx$ 与求和号 $\\int$ 的构造哲理**：
+   - 符号 $d$ 源于拉丁文 *differentia*（差），表示两相邻变量值之有限微差的无限化；
+   - 符号 $\\int$ 则是拉丁文 *summa*（总和）首字母 $S$ 的拉长变形，表征连续不可分量的连续累加。
+
+2. **为什么我的符号比牛顿的“流数点”更具生命力？**
+   - 牛顿的流数记号 $\\dot{x} = \\frac{dx}{dt}$ 强力绑定了单一的时间参数 $t$，面对多变量复合运算、隐函数求导及高维积分时极为局促；
+   - 我的记号 $\\frac{dy}{dx}$ 天然展现了**商的代数属性**，使链式法则 $\\frac{dz}{dx} = \\frac{dz}{dy} \\cdot \\frac{dy}{dx}$ 变得犹如分数约分般自明，极大降低了数学推理与计算的认知门槛。
+
+3. **微积分基本定理的形式化统一**：
+   $$\\int d(F(x)) = F(x), \\quad d\\left(\\int f(x)dx\\right) = f(x)dx$$
+   微分与积分在此成为互逆的操作算子，开启了18世纪分析学的大繁荣！`;
   }
 
-  const latestUserMessage = messages.filter(m => m.role === "user").pop();
-  const query = latestUserMessage ? latestUserMessage.content : "";
+  if (persona === "newton" || p.includes("牛顿") || p.includes("流数") || p.includes("行星")) {
+    return `### 【牛顿的回答】关于流数术与自然哲学的几何洞察
+
+在 1665 至 1666 年伍尔斯索普的瘟疫岁月中，我将几何量视为“连续运动生成的轨迹”。
+
+1. **流动量（Fluent）与流数（Fluxion）**：
+   - 设直线或曲线由点运动生成，位置 $x, y$ 称为流动量；
+   - 其瞬时生成速率即为流数，记作 $\\dot{x}, \\dot{y}$；
+   - 在无穷小时间微元 $o$（瞬，moment）内，流动量的增量为 $o\\dot{x}, o\\dot{y}$。
+
+2. **对行星运动与开普勒第二定律的证明**：
+   - 在《自然哲学的数学原理》（1687）中，我并非纯靠代数，而是运用了极限几何（初末比方法）证明了向心力定律：
+   - 质点在中心引力作用下，在相等时间内扫过相等的面积（$\\frac{dA}{dt} = \\frac{1}{2} r^2 \\dot{\\theta} = \\text{常数}$）。
+
+3. **与莱布尼茨之分歧**：
+   - 我更关注物理世界的连续运动与力学因果，流数是真实物理速度的抽象，而非纯粹的符号博弈。`;
+  }
+
+  if (persona === "berkeley" || p.includes("贝克莱") || p.includes("幽灵") || p.includes("危机")) {
+    return `### 【贝克莱主教的质询】《分析学者》(1734) 的逻辑审判
+
+致一位不信教的数学家：
+
+你们自诩数学是最严密的理性皇冠，然而在微积分的根基处，却充斥着逻辑自相矛盾的假定！
+
+1. **求 $y = x^2$ 导数的荒谬推导**：
+   设 $x$ 增加增量 $o$，则：
+   $$\\frac{(x+o)^2 - x^2}{o} = \\frac{2xo + o^2}{o} = 2x + o$$
+   - 在第一步除以 $o$ 时，你们假定 **$o \\neq 0$**（否则除以零无意义）；
+   - 在第二步得到导数 $2x$ 时，你们又假定 **$o = 0$**，从而把 $o$ 抛弃！
+   - **请问：$o$ 到底是不是零？**
+
+2. **“逝去量的幽灵” (Ghosts of departed quantities)**：
+   它既不是有限量，也不是无限小量，更不是纯粹的零。你们凭借这种模糊的直觉获得了正确的结果，却不过是“以错抵错的巧合”！正是这一质问，迫使后世柯西与魏尔斯特拉斯重构极限论。`;
+  }
+
+  if (persona === "cauchy" || persona === "weierstrass" || p.includes("极限") || p.includes("严格化") || p.includes("epsilon")) {
+    return `### 【现代分析学派】从几何直观到 $(\\varepsilon, \\delta)$ 严密化
+
+19 世纪分析学革命的核心任务，正是驱逐“幽灵般的无穷小”，代之以**静态的实数不等式系统**。
+
+1. **柯西与魏尔斯特拉斯的极限精确定义**：
+   设函数 $f(x)$ 在点 $x_0$ 附近有定义。若对于任意给定的正实数 $\\varepsilon > 0$，总存在一个正实数 $\\delta > 0$，使得当 $0 < |x - x_0| < \\delta$ 时，恒有：
+   $$|f(x) - L| < \\varepsilon$$
+   则称常数 $L$ 为当 $x \\to x_0$ 时 $f(x)$ 的极限，记作 $\\lim_{x \\to x_0} f(x) = L$。
+
+2. **导数的无矛盾定义**：
+   $$f'(x) = \\lim_{\\Delta x \\to 0} \\frac{f(x+\\Delta x) - f(x)}{\\Delta x}$$
+   这里没有任何“时而是零、时而非零”的神秘增量，只有两个实数比值随着自变量靠近 $0$ 时的收敛状态。
+
+3. **文明认知的质变**：
+   这一步将微积分彻底从几何画图与物理运动的依赖中解放出来，完成了纯代数形式化的严密奠基！`;
+  }
+
+  // General Historian
+  return `### 【微积分文明史总论】无限的驯服与分析学的诞生
+
+微积分的发展是人类文明史上最为壮阔的思想史诗之一，经历了四大关键跃迁：
+
+1. **古希腊萌芽（前3世纪）**：阿基米德“穷竭法”与双重归谬法，以有限多边形逐步逼近曲线面积，在不跨越无穷边界的前提下求解几何割补。
+2. **17世纪突破（1630-1680s）**：开普勒酒桶体积、卡瓦列利不可分量、费马伪等法、巴罗特征三角形，直至牛顿（流数术）与莱布尼茨（微积分符号体系）实现微积分基本定理的普遍化。
+3. **18世纪危机（1734）**：贝克莱悖论直击“无穷小量是逝去量的幽灵”，引发第二次数学危机，数学界在缺乏严格基础的大厦上飞速拓展。
+4. **19世纪严密化（1820-1870s）**：柯西与魏尔斯特拉斯创立 $(\\varepsilon, \\delta)$ 极限理论，戴德金与康托尔完成实数连续性完备构建，使微积分蜕变为现代数学分析。
+
+你可以随时在左侧切换 2D 文明沙盒演播古图证明，或提问任何数学家思想细节！`;
+}
+
+// Symbolic Solver & Code engine simulator
+app.post("/api/sympy/solve", (req, res) => {
+  const { codeType, params } = req.body;
 
   try {
-    if (aiClient) {
-      // Map frontend messages role of 'assistant' or 'model' to API format if needed
-      // Gemini chats accept role: "user" | "model"
-      const geminiContents = messages.map(msg => ({
-        role: msg.role === "assistant" ? "model" : "user",
-        parts: [{ text: msg.content || "" }]
-      }));
-
-      const response = await retryWithBackoff(() =>
-        aiClient!.models.generateContent({
-          model: "gemini-3.5-flash",
-          contents: geminiContents,
-          config: {
-            temperature: 0.7,
-            systemInstruction: "你是一个博古通今的微积分文明导师与应用数学家（名：微积分时空助手）。你精通微积分核心定理，更擅长阐述微积分如何缔造现代工程（塔科马大桥振动、开普勒轨道天体积分、麦克斯韦方程、人工智能反向传播梯度流、洛伦兹混沌声视）。用生动逼真、严谨而充满诗意和学术感的简体中文与学者聊天。如果字数过多请适当排版使用markdown表格或列表。"
-          }
-        })
-      );
-
-      return res.json({ text: response.text || "学理探讨进行中，暂时未获得有效回复。" });
+    let result: any = {};
+    if (codeType === "archimedes_parabola") {
+      // Parabola segment exhaustion series: Area = T * (1 + 1/4 + 1/16 + ... + 1/4^n)
+      const n = Math.min(Math.max(parseInt(params?.n || 6), 1), 30);
+      let sum = 0;
+      const terms: { k: number; term: number; partialSum: number; formula: string }[] = [];
+      for (let k = 0; k <= n; k++) {
+        const term = Math.pow(1 / 4, k);
+        sum += term;
+        terms.push({
+          k,
+          term,
+          partialSum: sum,
+          formula: `(1/4)^${k} = ${term.toFixed(6)}`,
+        });
+      }
+      result = {
+        title: "阿基米德抛物线弓形穷竭级数推导",
+        latexProof: `S_n = T_0 \\sum_{k=0}^{n} \\left(\\frac{1}{4}\\right)^k = T_0 \\cdot \\frac{1 - (1/4)^{n+1}}{1 - 1/4} = \\frac{4}{3} T_0 \\left(1 - \\frac{1}{4^{n+1}}\\right)`,
+        limit: 4 / 3,
+        currentSum: sum,
+        currentRatio: (sum / (4 / 3)) * 100,
+        terms: terms.slice(0, 10),
+        sympyCode: `from sympy import symbols, Sum, Rational, oo\nk, n = symbols('k n', integer=True)\ns_n = Sum(Rational(1, 4)**k, (k, 0, n)).doit()\nlimit_val = Sum(Rational(1, 4)**k, (k, 0, oo)).doit()\nprint(f"Partial Sum S_n: {s_n}")\nprint(f"Exact Limit: {limit_val} (equals 4/3)")`,
+      };
+    } else if (codeType === "leibniz_pi_series") {
+      // Leibniz Pi series: 1 - 1/3 + 1/5 - 1/7 + ... = pi/4
+      const n = Math.min(Math.max(parseInt(params?.n || 50), 1), 10000);
+      let sum = 0;
+      for (let k = 0; k < n; k++) {
+        sum += Math.pow(-1, k) / (2 * k + 1);
+      }
+      result = {
+        title: "莱布尼茨格里高利级数求圆周率",
+        latexProof: `\\frac{\\pi}{4} = \\sum_{k=0}^{\\infty} \\frac{(-1)^k}{2k+1} = 1 - \\frac{1}{3} + \\frac{1}{5} - \\frac{1}{7} + \\cdots`,
+        target: Math.PI / 4,
+        currentSum: sum,
+        approxPi: sum * 4,
+        error: Math.abs(sum * 4 - Math.PI),
+        sympyCode: `from sympy import symbols, Sum, oo, pi\nk = symbols('k', integer=True)\nleibniz_series = Sum((-1)**k / (2*k + 1), (k, 0, oo))\nprint(f"Analytical Sum: {leibniz_series.doit()} (exactly equals pi/4)")`,
+      };
+    } else if (codeType === "newton_binomial") {
+      // Newton binomial fluxion expansion for (1+x)^alpha
+      const alpha = parseFloat(params?.alpha || 0.5); // sqrt(1+x)
+      const x = parseFloat(params?.x || 0.5);
+      const termsCount = parseInt(params?.terms || 5);
+      
+      let sum = 0;
+      const terms: any[] = [];
+      let currentCoeff = 1;
+      
+      for (let k = 0; k < termsCount; k++) {
+        if (k === 0) {
+          currentCoeff = 1;
+        } else {
+          currentCoeff = (currentCoeff * (alpha - k + 1)) / k;
+        }
+        const termVal = currentCoeff * Math.pow(x, k);
+        sum += termVal;
+        terms.push({
+          k,
+          coeff: currentCoeff,
+          val: termVal,
+          expr: `${currentCoeff.toFixed(4)} * x^${k}`,
+        });
+      }
+      
+      const exact = Math.pow(1 + x, alpha);
+      result = {
+        title: `牛顿二项式任意指数展开式 (1+x)^${alpha}`,
+        latexProof: `(1+x)^\\alpha = 1 + \\alpha x + \\frac{\\alpha(\\alpha-1)}{2!} x^2 + \\frac{\\alpha(\\alpha-1)(\\alpha-2)}{3!} x^3 + \\cdots`,
+        exact,
+        approx: sum,
+        error: Math.abs(sum - exact),
+        terms,
+        sympyCode: `from sympy import symbols, series, sqrt\nx = symbols('x')\nexpr = (1 + x)**(${alpha})\nexpanded = series(expr, x, 0, n=${termsCount})\nprint(f"Taylor Series: {expanded}")`,
+      };
+    } else {
+      // Default Riemann Slicing
+      const slices = Math.min(Math.max(parseInt(params?.slices || 20), 2), 500);
+      const dx = 1 / slices;
+      let leftSum = 0;
+      let rightSum = 0;
+      let trapSum = 0;
+      for (let i = 0; i < slices; i++) {
+        const xL = i * dx;
+        const xR = (i + 1) * dx;
+        const yL = xL * xL;
+        const yR = xR * xR;
+        leftSum += yL * dx;
+        rightSum += yR * dx;
+        trapSum += ((yL + yR) / 2) * dx;
+      }
+      result = {
+        title: "古法矩形割补与黎曼切片逼近 (∫ x² dx, x∈[0,1])",
+        latexProof: `\\int_0^1 x^2 dx = \\lim_{n \\to \\infty} \\sum_{i=1}^n \\left(\\frac{i}{n}\\right)^2 \\frac{1}{n} = \\lim_{n \\to \\infty} \\frac{n(n+1)(2n+1)}{6n^3} = \\frac{1}{3}`,
+        exact: 1 / 3,
+        slices,
+        leftSum,
+        rightSum,
+        trapSum,
+        leftError: Math.abs(leftSum - 1 / 3),
+        rightError: Math.abs(rightSum - 1 / 3),
+        trapError: Math.abs(trapSum - 1 / 3),
+        sympyCode: `from sympy import symbols, integrate\nx = symbols('x')\nexact_integral = integrate(x**2, (x, 0, 1))\nprint(f"Definite Integral: {exact_integral}")`,
+      };
     }
-  } catch (error) {
-    console.error("Gemini Q&A failed, falling back to expert model:", error);
+
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
   }
-
-  // Fallback to highly optimized Calculus expert system (offline model)
-  const lowerQuery = query.toLowerCase();
-  let reply = "";
-
-  if (lowerQuery.includes("贝克莱") || lowerQuery.includes("幽灵") || lowerQuery.includes("无穷小") || lowerQuery.includes("极限")) {
-    reply = `### 🔮 贝克莱主教的无穷小之辩与极限解决
-
-在微积分诞生之初，**艾萨克·牛顿**和**莱布尼茨**对“无穷小量” $\\Delta x$ 的描述含混不清：在计算导数时，第一步假定 $\\Delta x \\neq 0$ 作为分母；第二步又令 $\\Delta x = 0$ 让它消失。
-
-**乔治·贝克莱主教**（Bishop George Berkeley）在1734年发表檄文，尖锐地讽刺：
-> “它们既不是有限的量，也不是极小的量，甚至根本不是虚无。它们是什么？难道是**‘已死之量的幽灵’**吗？”
-
-这就是著名的**第二次微积分危机**。
-
-#### 💡 魏尔斯特拉斯的 $\\epsilon-\\delta$ 极限定义
-这一危机延迟了一百多年，直到19世纪，由柯西、魏尔斯特拉斯等人建立 **$\\epsilon-\\delta$ 极限语言**，彻底抛弃了不确定的“幽灵量”，把“逼近”过程转化为确定性的实数范围控制，将逼近代数化。
-
-您可以切换到**“历史叙事”**切片，拖动滑块调节 $\\Delta x$ 体验割线如何完美逼近黄金切线的“幽灵收敛”过程！`;
-  } else if (lowerQuery.includes("塔科马") || lowerQuery.includes("共振") || lowerQuery.includes("桥") || lowerQuery.includes("物理") || lowerQuery.includes("微分方程")) {
-    reply = `### 🌉 自激共振与二阶非线性微分方程
-
-1940年美国华盛顿州的**塔科马海峡大桥**（Tacoma Narrows Bridge）由于轻微的风力骤然坍塌。通常人们误以为它是发生了“共振”，但本质上它是**自激空气动力弹性颤振（Aerodynamic Flutter）**。
-
-在物理仿真中，可以用二阶弹簧-阻尼动力学方程描述：
-$$m\\frac{d^2 x}{dt^2} + c(x)\\frac{dx}{dt} + k x = F(t)$$
-
-- **负阻尼效应**：当风速超过临界值，结构阻尼系数 $c(x)$ 在特定相位变为负值，说明流体在对结构做功补给能量，导致振幅指数级膨胀，最终解体。
-- **微分形式**：微积分为我们提供了预测波形发散与衰减的唯一利器。
-
-您可以前往**“物理仿真”**切片，通过提升刚度或添加空气阻尼（$c$ 系数）来亲手拯救这座桥梁！`;
-  } else if (lowerQuery.includes("麦克斯韦") || lowerQuery.includes("波动") || lowerQuery.includes("电磁") || lowerQuery.includes("梯度") || lowerQuery.includes("神经网络")) {
-    reply = `### 📡 微积分的双螺旋：麦克斯韦电磁场与神经网络梯度流
-
-这代表了微积分在人类科学史上的两次最顶峰的应用：
-
-#### 1. 麦克斯韦对称平衡的多维通量（散度与旋度）
-麦克斯韦通过四个微积分标量算子，将电场与磁场紧密编织在一起：
-- 变化磁场随时间积分可产生电场旋涡，变化电场又产生磁场。
-- 这组偏微分方程的奇妙解指向了一个恒定的波动速度——**光速**，从而断言光就是一种电磁波！
-
-#### 2. AI 神经网络的命运：高维梯度（Gradient Vector）
-现代人工神经网络（如Transformer）的核心参数调整是靠微积分的**导数链式法则**（Chain Rule）：
-$$\\nabla L = \\left[ \\frac{\\partial L}{\\partial w_1}, \\frac{\\partial L}{\\partial w_2}, \\dots \\right]^T$$
-我们在动辄千亿维度的复杂误差“山谷”中，永远朝着梯度的反方向（最陡峭下降方向）下山，让机器学会识别和思考。
-
-您可以前往**“现代电磁&AI”**切片，排版感受梯度向量方向如何搜寻函数极小值！`;
-  } else if (lowerQuery.includes("声音") || lowerQuery.includes("混沌") || lowerQuery.includes("洛伦兹") || lowerQuery.includes("美学")) {
-    reply = `### 🎵 连续之美发生器：自适应混沌几何与音画艺术
-
-当我们在三维极值空间中设定连续的洛伦兹吸引子（Lorentz Attractor）微分方程式：
-$$\\frac{dx}{dt} = \\sigma(y - x), \\quad \\frac{dy}{dt} = x(\\rho - z) - y, \\quad \\frac{dz}{dt} = xy - \\beta z$$
-
-- **蝴蝶效应**：初始条件即使微调 $10^{-6}$，在时间累积积分下，轨迹也会在不同的两翼环绕中产生截然相反的演化路径。
-- **声音合成**：我们将吸引子轨迹的速度 $\\frac{ds}{dt}$ 映射至音频由于微分流动而产生的数学交响曲线。
-
-您可以调节**“美学声视”**切片中的参数，听到混沌在跳跃双翼时的频率尖叫！`;
-  } else if (lowerQuery.includes("编译") || lowerQuery.includes("代码") || lowerQuery.includes("脚本")) {
-    reply = `### 💻 编译器：将微原方程映射到工业脚本
-
-在工程实际中，连续的分析符号没法直接塞给CPU。我们需要将符号算子转化为数值微积分求解器：
-- 导数 $\\frac{dy}{dt}$ 转化为有限差分： $y_{n+1} = y_n + f(t_n, y_n) \\Delta t$。
-- 积分转化为黎曼连续求和或龙格-库塔高阶逼近。
-
-在**“代码编译器”**切片中，您可以选择任何一个理论物理公式，一键转化生成 Python/Matlab 脚本和 WebGL 3D 渲染器！`;
-  } else {
-    reply = `### 👋 您好！我是微积分文明时空助理
-
-很高兴与您共同探讨连续变化的无声语言——**微积分**！
-
-您可以向我提问：
-- *“为什么偏微分方程能预测光速？”*
-- *“如何理解AI深度学习本质上是微积分在千亿维度下的下山游戏？”*
-- *“贝克莱主教的无穷小幽灵到底是怎么被彻底封印的？”*
-- *“给我介绍下洛伦兹吸引子的混沌美学吧！”*
-
-或者，您可以点击屏幕顶部的各个切片来操作动态数学仿真！在这里，微积分不再是枯燥的考试公式，它是文明史中最震撼人心的工具。请随时提问！`;
-  }
-
-  return res.json({ text: reply });
 });
 
+// Real-time Python Code Execution & Standalone Verification Endpoint
+app.post("/api/python/execute", (req, res) => {
+  const { code, args = [] } = req.body;
 
-// Hook up Vite middleware in development or serve static build files in production
+  if (!code || typeof code !== "string") {
+    return res.status(400).json({ error: "No code provided" });
+  }
+
+  // Safety filter for harmful system commands
+  const dangerousPatterns = [
+    /import\s+os\s*;\s*os\.system/i,
+    /subprocess\.Popen.*rm\s+-rf/i,
+    /shutil\.rmtree/i,
+    /os\.remove\s*\(\s*["']\/.*["']\s*\)/i,
+    /__import__\s*\(\s*["']os["']\s*\)\.system/i,
+  ];
+
+  for (const pattern of dangerousPatterns) {
+    if (pattern.test(code)) {
+      return res.status(403).json({
+        success: false,
+        error: "安全保护策略：禁止执行破坏性系统调用或文件删除操作。",
+        stdout: "",
+        stderr: "Execution blocked: Detected potentially destructive system command.",
+        exitCode: 1,
+      });
+    }
+  }
+
+  // Standalone Verification check (Verify whether script relies ONLY on Python standard libraries: sys, math, json, etc.)
+  const externalDependenciesCheck = {
+    isFullyStandalone: true,
+    detectedImports: [] as string[],
+    externalLibraries: [] as string[],
+    notes: "代码完全基于 Python 原生内置标准库 (math, sys, json 等)，无需安装第三方 pip 依赖，复制到任何 Python 3 环境均可独立直接运行！",
+  };
+
+  const importMatches = code.matchAll(/(?:from\s+([a-zA-Z0-9_]+)\s+import|import\s+([a-zA-Z0-9_]+))/g);
+  const standardBuiltins = new Set([
+    "math", "sys", "json", "time", "random", "itertools", "functools",
+    "collections", "decimal", "fractions", "re", "string", "typing",
+    "copy", "statistics", "bisect", "heapq", "datetime", "enum"
+  ]);
+
+  for (const match of importMatches) {
+    const pkg = match[1] || match[2];
+    if (pkg) {
+      externalDependenciesCheck.detectedImports.push(pkg);
+      if (!standardBuiltins.has(pkg)) {
+        externalDependenciesCheck.isFullyStandalone = false;
+        externalDependenciesCheck.externalLibraries.push(pkg);
+      }
+    }
+  }
+
+  if (!externalDependenciesCheck.isFullyStandalone) {
+    externalDependenciesCheck.notes = `检测到可能依赖第三方扩展库 [${externalDependenciesCheck.externalLibraries.join(", ")}]。若在外部纯净环境中运行，需预先 pip install。`;
+  }
+
+  // Write temporary file
+  const tempFileName = `calculus_script_${Date.now()}_${Math.random().toString(36).substring(7)}.py`;
+  const tempFilePath = path.join(os.tmpdir(), tempFileName);
+
+  fs.writeFile(tempFilePath, code, "utf8", (writeErr) => {
+    if (writeErr) {
+      return res.status(500).json({
+        success: false,
+        error: "无法写入临时脚本文件",
+        details: writeErr.message,
+      });
+    }
+
+    const startTime = Date.now();
+    const cmdArgs = [tempFilePath, ...(Array.isArray(args) ? args.map(String) : [])];
+
+    const pythonProcess = spawn("python3", cmdArgs, {
+      timeout: 8000, // 8s timeout limit
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    pythonProcess.stdout.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    pythonProcess.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    pythonProcess.on("error", (procErr) => {
+      fs.unlink(tempFilePath, () => {});
+      return res.json({
+        success: false,
+        stdout,
+        stderr: stderr || procErr.message,
+        exitCode: 1,
+        executionTimeMs: Date.now() - startTime,
+        standaloneCheck: externalDependenciesCheck,
+      });
+    });
+
+    pythonProcess.on("close", (exitCode) => {
+      fs.unlink(tempFilePath, () => {});
+      const executionTimeMs = Date.now() - startTime;
+
+      res.json({
+        success: exitCode === 0,
+        stdout,
+        stderr,
+        exitCode: exitCode ?? 0,
+        executionTimeMs,
+        standaloneCheck: externalDependenciesCheck,
+      });
+    });
+  });
+});
+
+// Setup Vite development middleware or static production serving
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -360,13 +535,13 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Calculus Civilization Applet running on http://0.0.0.0:${PORT}`);
+    console.log(`History of Calculus Lab Server running on http://localhost:${PORT}`);
   });
 }
 

@@ -1,6 +1,6 @@
 {
-  "name": "微积分文明史",
-  "description": "探索微积分如何重塑人类文明，提供沉浸式动态物理仿真、数学微积分沙盒、AI交错历史推演及公式代码编译器。",
+  "name": "微积分文明史与思想演化实验室",
+  "description": "探索微积分思想演进与概念形式化建模的交互式文明实验室，集2D古籍几何证明沙盒、无限分割切片演算、牛莱争论演播、六大里程碑突破、Python/SymPy符号求解与AI历史导师于一体。",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
